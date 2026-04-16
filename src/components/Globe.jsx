@@ -20,10 +20,12 @@ const EarthMaterial = shaderMaterial(
   `
     attribute float aDisplacement;
     attribute float aType;
+    attribute float aSeverity;
 
     varying vec2 vUv;
     varying float vDisp;
     varying float vType;
+    varying float vSeverity;
     varying vec3 vNormal;
     varying vec3 vPosition;
 
@@ -31,6 +33,7 @@ const EarthMaterial = shaderMaterial(
       vUv = uv;
       vDisp = aDisplacement;
       vType = aType;
+      vSeverity = aSeverity;
       vNormal = normalize(normalMatrix * normal);
       vPosition = (modelViewMatrix * vec4(position, 1.0)).xyz;
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
@@ -44,6 +47,7 @@ const EarthMaterial = shaderMaterial(
     varying vec2 vUv;
     varying float vDisp;
     varying float vType;
+    varying float vSeverity;
     varying vec3 vNormal;
     varying vec3 vPosition;
 
@@ -58,6 +62,39 @@ const EarthMaterial = shaderMaterial(
       vec3 finalColor = mix(brightenedLand, brightenedOcean, isOcean);
 
       float absDisp = abs(vDisp);
+
+      // ═══════════════════════════════════════════════════════════
+      // LOW-SEVERITY COLOR HIGHLIGHT
+      // When deformation is minimal but a crisis exists, apply a
+      // soft color overlay so minor crises remain visible.
+      // Fades out as deformation increases (high severity uses
+      // the existing deformation-based effects instead).
+      // ═══════════════════════════════════════════════════════════
+      float lowSevThreshold = 0.3;  // severity below this gets color highlight
+      float dispThreshold   = 0.015; // deformation below this triggers highlight
+
+      if (vType > 0.5 && vSeverity > 0.0 && absDisp < dispThreshold) {
+        // Darker, muted highlight colors that blend with the terrain
+        vec3 highlightColor = vec3(0.8, 0.08, 0.08);  // bright crimson red (conflict)
+        if (vType > 1.5 && vType < 2.5) highlightColor = vec3(0.1, 0.18, 0.45);  // dark blue (economic)
+        if (vType > 2.5 && vType < 3.5) highlightColor = vec3(0.5, 0.28, 0.05);  // dark amber (disaster)
+        if (vType > 3.5 && vType < 4.5) highlightColor = vec3(0.06, 0.35, 0.12);  // dark green (health)
+
+        // Intensity: stronger for lower severity, fades as deformation kicks in
+        float sevFactor = 1.0 - smoothstep(0.0, lowSevThreshold, vSeverity);
+        float dispFade  = 1.0 - smoothstep(0.0, dispThreshold, absDisp);
+        float strength  = sevFactor * dispFade;
+
+        // Minimum visible intensity
+        strength = max(strength, 0.25 * dispFade);
+
+        // Soft pulsing glow animation (slow, subtle)
+        float pulse = 0.9 + 0.1 * sin(uTime * 2.0 + vPosition.x * 10.0 + vPosition.z * 7.0);
+
+        // Blend: darken base more for opaque look, then add strong emissive tint
+        finalColor = mix(finalColor, finalColor * 0.5, strength * 0.5);
+        finalColor += highlightColor * strength * 0.6 * pulse;
+      }
 
       // ── CONFLICT (type 1): Fiery orange/red emissive ──
       if (vType > 0.5 && vType < 1.5 && absDisp > 0.005) {
@@ -286,6 +323,7 @@ const Earth = ({ crisisData, onCountryClick, autoRotate, navigateTarget, onNavig
 
     geo.setAttribute('aDisplacement', new THREE.BufferAttribute(new Float32Array(vertexCount), 1))
     geo.setAttribute('aType', new THREE.BufferAttribute(new Float32Array(vertexCount), 1))
+    geo.setAttribute('aSeverity', new THREE.BufferAttribute(new Float32Array(vertexCount), 1))
 
     deformationReady.current = true
   }, [])
@@ -330,6 +368,7 @@ const Earth = ({ crisisData, onCountryClick, autoRotate, navigateTarget, onNavig
     const vertexCount = orig.length / 3
     const dispAmounts = new Float32Array(vertexCount)
     const dispTypes = new Float32Array(vertexCount)
+    const dispSeverities = new Float32Array(vertexCount)
 
     // Pre-generate spike clusters and wave ring params
     const spikeData = []
@@ -450,6 +489,21 @@ const Earth = ({ crisisData, onCountryClick, autoRotate, navigateTarget, onNavig
           maxTypeWeight = weight
           dominantType = typeCode
         }
+
+        // Track the severity of the crisis affecting this vertex.
+        // Only tag vertices CLOSE to the crisis center (within 8°)
+        // so the color highlight stays localized, not continent-wide.
+        const COLOR_HIGHLIGHT_RADIUS = 8
+        if (typeCode > 0 && dist < COLOR_HIGHLIGHT_RADIUS && crisis.severity > dispSeverities[vi]) {
+          // Apply a distance-based falloff so edges fade smoothly
+          const proximityFalloff = Math.pow(Math.max(0, 1 - dist / COLOR_HIGHLIGHT_RADIUS), 2)
+          dispSeverities[vi] = crisis.severity * proximityFalloff
+          // If no dominant type was set yet via deformation weight,
+          // fall back to this crisis type so the shader knows what color to use.
+          if (dominantType === 0) {
+            dominantType = typeCode
+          }
+        }
       }
 
       const newR = r + totalDisplacement
@@ -464,6 +518,12 @@ const Earth = ({ crisisData, onCountryClick, autoRotate, navigateTarget, onNavig
     targetPositions.current = target
     targetDispAmounts.current = dispAmounts
     targetDispTypes.current = dispTypes
+    // Store severity data for the low-severity color highlight in the shader
+    if (geometryRef.current && geometryRef.current.attributes.aSeverity) {
+      const sevAttr = geometryRef.current.attributes.aSeverity.array
+      sevAttr.set(dispSeverities)
+      geometryRef.current.attributes.aSeverity.needsUpdate = true
+    }
   }, [crisisData])
 
   // ── Animation loop ──
